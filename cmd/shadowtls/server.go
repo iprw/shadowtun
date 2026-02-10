@@ -13,8 +13,8 @@ import (
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
 
-	stls "shadowtls-tunnel/pkg/shadowtls"
-	"shadowtls-tunnel/pkg/socks5"
+	stls "github.com/iprw/shadowtun/pkg/shadowtls"
+	"github.com/iprw/shadowtun/pkg/socks5"
 )
 
 const (

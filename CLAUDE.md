@@ -8,7 +8,7 @@ ShadowTLS tunnel implementation in Go. Disguises arbitrary TCP traffic as legiti
 
 ## Repository Structure
 
-Single Go module (`shadowtls-tunnel`), one binary with `--mode server|client`:
+Single Go module (`shadowtun`), one binary with `--mode server|client`:
 
 - **`pkg/shadowtls/`** — Protocol-level code: TLS handshake (uTLS with Chrome_Auto fingerprint), address parsing, ShadowTLS client wrapper + factory, and logrus logger adapter for sing-shadowtls.
 - **`pkg/socks5/`** — SOCKS5 server implementing RFC 1928 TCP CONNECT with idle/write timeouts on relay connections.

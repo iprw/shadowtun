@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	stls "shadowtls-tunnel/pkg/shadowtls"
+	stls "github.com/iprw/shadowtun/pkg/shadowtls"
 )
 
 var globalStats *Stats
