@@ -274,41 +274,24 @@ func relay(ctx context.Context, local, tunnel net.Conn, stats *Stats) (bytesOut,
 	done := make(chan struct{}, 2)
 
 	go func() {
-		bytesOut = copyConn(tunnel, local, stats) // local → tunnel
-		tunnel.Close()                            // unblock tunnel → local
+		n, _ := relaypkg.CopyConn(tunnel, local, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout, func(n int) {
+			stats.AddBytes(uint64(n))
+		})
+		bytesOut = n
+		tunnel.Close() // unblock tunnel → local
 		done <- struct{}{}
 	}()
 
 	go func() {
-		bytesIn = copyConn(local, tunnel, stats) // tunnel → local
-		local.Close()                            // unblock local → tunnel
+		n, _ := relaypkg.CopyConn(local, tunnel, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout, func(n int) {
+			stats.AddBytes(uint64(n))
+		})
+		bytesIn = n
+		local.Close() // unblock local → tunnel
 		done <- struct{}{}
 	}()
 
 	<-done
 	<-done
 	return
-}
-
-func copyConn(dst, src net.Conn, stats *Stats) int64 {
-	buf := make([]byte, copyBufSize)
-	var total int64
-	for {
-		src.SetReadDeadline(time.Now().Add(relaypkg.DefaultIdleTimeout))
-		n, err := src.Read(buf)
-		if n > 0 {
-			dst.SetWriteDeadline(time.Now().Add(relaypkg.DefaultWriteTimeout))
-			written, werr := dst.Write(buf[:n])
-			if written > 0 {
-				total += int64(written)
-				stats.AddBytes(uint64(written))
-			}
-			if werr != nil {
-				return total
-			}
-		}
-		if err != nil {
-			return total
-		}
-	}
 }

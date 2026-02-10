@@ -41,7 +41,7 @@ func (h *forwardHandler) NewConnection(ctx context.Context, conn net.Conn, metad
 
 	go func() {
 		defer wg.Done()
-		relaypkg.CopyConn(backend, conn, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout)
+		relaypkg.CopyConn(backend, conn, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout, nil)
 		if tc, ok := backend.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -49,7 +49,7 @@ func (h *forwardHandler) NewConnection(ctx context.Context, conn net.Conn, metad
 
 	go func() {
 		defer wg.Done()
-		relaypkg.CopyConn(conn, backend, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout)
+		relaypkg.CopyConn(conn, backend, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout, nil)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}

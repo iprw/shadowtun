@@ -94,13 +94,13 @@ func (h *Handler) handleConnect(conn net.Conn, target string) error {
 
 	go func() {
 		defer wg.Done()
-		relay.CopyConn(targetConn, conn, relay.DefaultIdleTimeout, relay.DefaultWriteTimeout)
+		relay.CopyConn(targetConn, conn, relay.DefaultIdleTimeout, relay.DefaultWriteTimeout, nil)
 		targetConn.(*net.TCPConn).CloseWrite()
 	}()
 
 	go func() {
 		defer wg.Done()
-		relay.CopyConn(conn, targetConn, relay.DefaultIdleTimeout, relay.DefaultWriteTimeout)
+		relay.CopyConn(conn, targetConn, relay.DefaultIdleTimeout, relay.DefaultWriteTimeout, nil)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
