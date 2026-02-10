@@ -10,46 +10,78 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
+	relaypkg "github.com/iprw/shadowtun/pkg/relay"
 	stls "github.com/iprw/shadowtun/pkg/shadowtls"
 )
 
-var globalStats *Stats
-
 const (
-	idleTimeout   = 5 * time.Minute
-	writeTimeout  = 30 * time.Second
 	verifyTimeout = 5 * time.Second
 	copyBufSize   = 32 * 1024
 	maxRetries    = 3
 )
 
-func runClient(listen, server, sni, password string, poolSize int, ttl, backoff, timeout, statsInterval time.Duration) {
-	globalStats = NewStats()
+// ClientConfig holds configuration for the ShadowTLS client
+type ClientConfig struct {
+	ListenAddr    string
+	ServerAddr    string
+	SNI           string
+	Password      string
+	PoolSize      int
+	TTL           time.Duration
+	Backoff       time.Duration
+	Timeout       time.Duration
+	StatsInterval time.Duration
+	Logger        *logrus.Logger
+}
 
-	client, err := stls.NewClient(server, sni, password, timeout, Log)
+// Client represents a ShadowTLS client instance
+type Client struct {
+	config *ClientConfig
+	stats  *Stats
+	pool   *ConnPool
+	log    *logrus.Logger
+}
+
+// NewClient creates a new client instance
+func NewClient(config *ClientConfig) *Client {
+	logger := config.Logger
+	if logger == nil {
+		logger = Log // Fallback to global logger if not provided
+	}
+	return &Client{
+		config: config,
+		stats:  NewStats(),
+		log:    logger,
+	}
+}
+
+func (c *Client) Run() error {
+	client, err := stls.NewClient(c.config.ServerAddr, c.config.SNI, c.config.Password, c.config.Timeout, c.log)
 	if err != nil {
-		Log.Fatalf("Failed to create ShadowTLS client: %v", err)
+		return fmt.Errorf("failed to create ShadowTLS client: %v", err)
 	}
 
 	factory := &stls.Factory{
 		Client: client,
 	}
 
-	pool := NewConnPool(poolSize, ttl, backoff, factory.Create, globalStats)
-	pool.Start()
+	c.pool = NewConnPool(c.config.PoolSize, c.config.TTL, c.config.Backoff, factory.Create, c.stats)
+	c.pool.Start()
 
-	listener, err := net.Listen("tcp", listen)
+	listener, err := net.Listen("tcp", c.config.ListenAddr)
 	if err != nil {
-		Log.Fatalf("Failed to listen on %s: %v", listen, err)
+		return fmt.Errorf("failed to listen on %s: %v", c.config.ListenAddr, err)
 	}
 
-	Log.Infof("shadowtls client started")
-	Log.Infof("  Listen: %s", listen)
-	Log.Infof("  Server: %s", server)
-	Log.Infof("  SNI: %s", sni)
-	Log.Infof("  Pool size: %d, TTL: %v, Backoff: %v", poolSize, ttl, backoff)
-	if statsInterval > 0 {
-		Log.Infof("  Stats interval: %v", statsInterval)
+	c.log.Infof("shadowtls client started")
+	c.log.Infof("  Listen: %s", c.config.ListenAddr)
+	c.log.Infof("  Server: %s", c.config.ServerAddr)
+	c.log.Infof("  SNI: %s", c.config.SNI)
+	c.log.Infof("  Pool size: %d, TTL: %v, Backoff: %v", c.config.PoolSize, c.config.TTL, c.config.Backoff)
+	if c.config.StatsInterval > 0 {
+		c.log.Infof("  Stats interval: %v", c.config.StatsInterval)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -61,8 +93,8 @@ func runClient(listen, server, sni, password string, poolSize int, ttl, backoff,
 		for sig := range sigChan {
 			switch sig {
 			case syscall.SIGUSR1:
-				avail, cap := pool.Stats()
-				snap := globalStats.Snapshot(avail, cap)
+				avail, cap := c.pool.Stats()
+				snap := c.stats.Snapshot(avail, cap)
 				fmt.Println(snap.String())
 			case syscall.SIGINT, syscall.SIGTERM:
 				Log.Info("Shutting down...")
@@ -73,15 +105,15 @@ func runClient(listen, server, sni, password string, poolSize int, ttl, backoff,
 		}
 	}()
 
-	if statsInterval > 0 {
+	if c.config.StatsInterval > 0 {
 		go func() {
-			ticker := time.NewTicker(statsInterval)
+			ticker := time.NewTicker(c.config.StatsInterval)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
-					avail, cap := pool.Stats()
-					snap := globalStats.Snapshot(avail, cap)
+					avail, cap := c.pool.Stats()
+					snap := c.stats.Snapshot(avail, cap)
 					snap.Log()
 				case <-ctx.Done():
 					return
@@ -103,29 +135,30 @@ func runClient(listen, server, sni, password string, poolSize int, ttl, backoff,
 		}
 
 		wg.Add(1)
-		go func(c net.Conn) {
+		go func(c_conn net.Conn) {
 			defer wg.Done()
-			handleConnection(ctx, c, pool, globalStats)
+			c.handleConnection(ctx, c_conn)
 		}(conn)
 	}
 
 	Log.Info("Waiting for connections to close...")
 	wg.Wait()
-	pool.Stop()
+	c.pool.Stop()
 
-	avail, cap := pool.Stats()
-	snap := globalStats.Snapshot(avail, cap)
+	avail, cap := c.pool.Stats()
+	snap := c.stats.Snapshot(avail, cap)
 	fmt.Println(snap.String())
 
 	Log.Info("Shutdown complete")
+	return nil
 }
 
-func handleConnection(ctx context.Context, local net.Conn, pool *ConnPool, stats *Stats) {
+func (c *Client) handleConnection(ctx context.Context, local net.Conn) {
 	connStart := time.Now()
-	stats.ConnStart()
+	c.stats.ConnStart()
 	defer func() {
-		stats.ConnEnd()
-		stats.RecordConnLifetime(time.Since(connStart))
+		c.stats.ConnEnd()
+		c.stats.RecordConnLifetime(time.Since(connStart))
 	}()
 	defer local.Close()
 
@@ -138,36 +171,36 @@ func handleConnection(ctx context.Context, local net.Conn, pool *ConnPool, stats
 	local.SetReadDeadline(time.Time{})
 	if err != nil || n == 0 {
 		Log.Debugf("No initial data from %s: %v", local.RemoteAddr(), err)
-		stats.ConnErrors.Add(1)
+		c.stats.ConnErrors.Add(1)
 		return
 	}
 	initialData := initialBuf[:n]
 
 	// Get a verified tunnel, retrying stale connections
-	tunnel, firstResponse, err := acquireTunnel(ctx, pool, stats, initialData)
+	tunnel, firstResponse, err := acquireTunnel(ctx, c.pool, c.stats, initialData)
 	if err != nil {
 		Log.Warnf("Failed to get tunnel: %v", err)
-		stats.ConnErrors.Add(1)
+		c.stats.ConnErrors.Add(1)
 		return
 	}
 	defer tunnel.Close()
 
 	// Forward the server's first response to the local client
-	local.SetWriteDeadline(time.Now().Add(writeTimeout))
+	local.SetWriteDeadline(time.Now().Add(relaypkg.DefaultWriteTimeout))
 	_, err = local.Write(firstResponse)
 	local.SetWriteDeadline(time.Time{})
 	if err != nil {
 		Log.Debugf("Failed to forward response to client: %v", err)
-		stats.ConnErrors.Add(1)
+		c.stats.ConnErrors.Add(1)
 		return
 	}
 
 	// Bidirectional relay
-	bytesOut, bytesIn := relay(ctx, local, tunnel, stats)
+	bytesOut, bytesIn := relay(ctx, local, tunnel, c.stats)
 
 	Log.Infof("Connection closed: %s out, %s in, %v",
-		formatBytesShort(int64(len(initialData))+bytesOut),
-		formatBytesShort(int64(len(firstResponse))+bytesIn),
+		formatBytes(uint64(int64(len(initialData))+bytesOut), true),
+		formatBytes(uint64(int64(len(firstResponse))+bytesIn), true),
 		time.Since(connStart).Round(time.Millisecond))
 }
 
@@ -261,10 +294,10 @@ func copyConn(dst, src net.Conn, stats *Stats) int64 {
 	buf := make([]byte, copyBufSize)
 	var total int64
 	for {
-		src.SetReadDeadline(time.Now().Add(idleTimeout))
+		src.SetReadDeadline(time.Now().Add(relaypkg.DefaultIdleTimeout))
 		n, err := src.Read(buf)
 		if n > 0 {
-			dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+			dst.SetWriteDeadline(time.Now().Add(relaypkg.DefaultWriteTimeout))
 			written, werr := dst.Write(buf[:n])
 			if written > 0 {
 				total += int64(written)

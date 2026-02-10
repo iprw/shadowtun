@@ -80,7 +80,19 @@ func main() {
 		if *handshake == "" && !*wildcardSNI {
 			Log.Fatal("Server mode requires --handshake or --wildcard-sni")
 		}
-		runServer(*listen, *forward, *handshake, *password, *wildcardSNI, *socks5Mode)
+		serverConfig := &ServerConfig{
+			ListenAddr:  *listen,
+			ForwardAddr: *forward,
+			Handshake:   *handshake,
+			Password:    *password,
+			WildcardSNI: *wildcardSNI,
+			Socks5Mode:  *socks5Mode,
+			Logger:      Log,
+		}
+		server := NewServer(serverConfig)
+		if err := server.Run(); err != nil {
+			Log.Fatalf("Server error: %v", err)
+		}
 	case "client":
 		if *server == "" || *sni == "" {
 			Log.Fatal("Client mode requires --server and --sni")
@@ -88,7 +100,22 @@ func main() {
 		if *listen == "" {
 			*listen = "127.0.0.1:1080"
 		}
-		runClient(*listen, *server, *sni, *password, *poolSize, *ttl, *backoff, *timeout, *statsInterval)
+		clientConfig := &ClientConfig{
+			ListenAddr:    *listen,
+			ServerAddr:    *server,
+			SNI:           *sni,
+			Password:      *password,
+			PoolSize:      *poolSize,
+			TTL:           *ttl,
+			Backoff:       *backoff,
+			Timeout:       *timeout,
+			StatsInterval: *statsInterval,
+			Logger:        Log,
+		}
+		client := NewClient(clientConfig)
+		if err := client.Run(); err != nil {
+			Log.Fatalf("Client error: %v", err)
+		}
 	default:
 		Log.Fatalf("Unknown mode: %s (use 'server' or 'client')", *mode)
 	}

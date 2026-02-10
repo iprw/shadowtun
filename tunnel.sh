@@ -194,6 +194,7 @@ echo "[2/5] Starting shadowtls client..."
     --mode client \
     --listen "127.0.0.1:$LISTEN_PORT" \
     --server "$SERVER" \
+    --timeout 30s \
     --sni "$SNI" \
     --ttl 10s \
     --password "$PASSWORD" \

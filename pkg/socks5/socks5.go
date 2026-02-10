@@ -8,12 +8,14 @@ import (
 	"net"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/sirupsen/logrus"
+
+	"github.com/iprw/shadowtun/pkg/relay"
 )
 
 const (
+	// Version is the SOCKS protocol version (SOCKS5).
 	Version = 0x05
 
 	// Auth methods
@@ -34,9 +36,6 @@ const (
 	repHostUnreach      = 0x04
 	repCmdNotSupported  = 0x07
 	repAtypNotSupported = 0x08
-
-	idleTimeout  = 5 * time.Minute
-	writeTimeout = 30 * time.Second
 )
 
 // Handler handles SOCKS5 protocol on a connection.
@@ -58,19 +57,19 @@ func NewHandler(username, password string, logger *logrus.Logger) *Handler {
 // Handle processes a SOCKS5 connection.
 func (h *Handler) Handle(ctx context.Context, conn net.Conn) error {
 	if err := h.handshake(conn); err != nil {
-		return fmt.Errorf("handshake failed: %w", err)
+		return fmt.Errorf("handshake: %w", err)
 	}
 
 	cmd, target, err := h.readRequest(conn)
 	if err != nil {
-		return fmt.Errorf("read request failed: %w", err)
+		return fmt.Errorf("read request: %w", err)
 	}
 
 	switch cmd {
 	case cmdConnect:
 		return h.handleConnect(conn, target)
 	default:
-		h.sendReply(conn, repCmdNotSupported, nil)
+		_ = h.sendReply(conn, repCmdNotSupported, nil)
 		return fmt.Errorf("unsupported command: %d", cmd)
 	}
 }
@@ -80,14 +79,14 @@ func (h *Handler) handleConnect(conn net.Conn, target string) error {
 
 	targetConn, err := net.Dial("tcp", target)
 	if err != nil {
-		h.sendReply(conn, repHostUnreach, nil)
-		return fmt.Errorf("connect to %s failed: %w", target, err)
+		_ = h.sendReply(conn, repHostUnreach, nil)
+		return fmt.Errorf("connect to %s: %w", target, err)
 	}
 	defer targetConn.Close()
 
 	localAddr := targetConn.LocalAddr().(*net.TCPAddr)
 	if err := h.sendReply(conn, repSuccess, localAddr); err != nil {
-		return fmt.Errorf("send reply failed: %w", err)
+		return fmt.Errorf("send reply: %w", err)
 	}
 
 	var wg sync.WaitGroup
@@ -95,13 +94,13 @@ func (h *Handler) handleConnect(conn net.Conn, target string) error {
 
 	go func() {
 		defer wg.Done()
-		copyConn(targetConn, conn)
+		relay.CopyConn(targetConn, conn, relay.DefaultIdleTimeout, relay.DefaultWriteTimeout)
 		targetConn.(*net.TCPConn).CloseWrite()
 	}()
 
 	go func() {
 		defer wg.Done()
-		copyConn(conn, targetConn)
+		relay.CopyConn(conn, targetConn, relay.DefaultIdleTimeout, relay.DefaultWriteTimeout)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -109,24 +108,6 @@ func (h *Handler) handleConnect(conn net.Conn, target string) error {
 
 	wg.Wait()
 	return nil
-}
-
-// copyConn copies data with idle and write timeouts to prevent ghost connections.
-func copyConn(dst, src net.Conn) {
-	buf := make([]byte, 32*1024)
-	for {
-		src.SetReadDeadline(time.Now().Add(idleTimeout))
-		n, err := src.Read(buf)
-		if n > 0 {
-			dst.SetWriteDeadline(time.Now().Add(writeTimeout))
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
 }
 
 func (h *Handler) handshake(conn net.Conn) error {
@@ -148,7 +129,7 @@ func (h *Handler) handshake(conn net.Conn) error {
 
 	if needAuth {
 		if !slices.Contains(methods, authPassword) {
-			conn.Write([]byte{Version, authNoAccept})
+			_, _ = conn.Write([]byte{Version, authNoAccept})
 			return fmt.Errorf("client doesn't support password auth")
 		}
 
@@ -161,7 +142,7 @@ func (h *Handler) handshake(conn net.Conn) error {
 		}
 	} else {
 		if !slices.Contains(methods, authNone) {
-			conn.Write([]byte{Version, authNoAccept})
+			_, _ = conn.Write([]byte{Version, authNoAccept})
 			return fmt.Errorf("client doesn't support no-auth")
 		}
 		if _, err := conn.Write([]byte{Version, authNone}); err != nil {
@@ -200,8 +181,8 @@ func (h *Handler) readAuth(conn net.Conn) error {
 	}
 
 	if string(username) != h.username || string(password) != h.password {
-		conn.Write([]byte{0x01, 0x01})
-		return fmt.Errorf("auth failed")
+		_, _ = conn.Write([]byte{0x01, 0x01})
+		return fmt.Errorf("auth: invalid credentials")
 	}
 
 	if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
@@ -250,7 +231,7 @@ func (h *Handler) readRequest(conn net.Conn) (cmd byte, addr string, err error) 
 		host = net.IP(addrBytes).String()
 
 	default:
-		h.sendReply(conn, repAtypNotSupported, nil)
+		_ = h.sendReply(conn, repAtypNotSupported, nil)
 		return 0, "", fmt.Errorf("unsupported address type: %d", header[3])
 	}
 

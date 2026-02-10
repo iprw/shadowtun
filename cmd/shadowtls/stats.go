@@ -278,7 +278,7 @@ Timing:
 		snap.PoolAvgWait.Round(time.Millisecond),
 		snap.ActiveConns, snap.PeakConns, snap.TotalConns,
 		snap.ConnErrors,
-		formatBytes(snap.TotalBytes),
+		formatBytes(snap.TotalBytes, false),
 		rttStr,
 		lifetimeStr,
 		poolAgeStr,
@@ -292,7 +292,7 @@ func (snap StatsSnapshot) Log() {
 	if snap.Uptime > 0 {
 		bps := float64(snap.TotalBytes) / snap.Uptime.Seconds()
 		if bps >= 1024 {
-			rate = formatBytes(uint64(bps)) + "/s"
+			rate = formatBytes(uint64(bps), false) + "/s"
 		} else {
 			rate = fmt.Sprintf("%dB/s", uint64(bps))
 		}
@@ -321,14 +321,17 @@ func (snap StatsSnapshot) Log() {
 		snap.AvgConnectTime.Round(time.Millisecond),
 		snap.AvgConnLifetime.Round(time.Millisecond),
 		snap.AvgPoolAge.Round(time.Millisecond),
-		formatBytes(snap.TotalBytes), rate,
+		formatBytes(snap.TotalBytes, false), rate,
 		problems,
 	)
 }
 
-func formatBytes(b uint64) string {
+func formatBytes(b uint64, short bool) string {
 	const unit = 1024
 	if b < unit {
+		if short {
+			return fmt.Sprintf("%dB", b)
+		}
 		return fmt.Sprintf("%d B", b)
 	}
 	div, exp := uint64(unit), 0
@@ -336,18 +339,8 @@ func formatBytes(b uint64) string {
 		div *= unit
 		exp++
 	}
+	if short {
+		return fmt.Sprintf("%.1f%cB", float64(b)/float64(div), "KMGTPE"[exp])
+	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-func formatBytesShort(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%dB", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%cB", float64(b)/float64(div), "KMGTPE"[exp])
 }

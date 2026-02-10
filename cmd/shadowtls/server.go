@@ -2,48 +2,46 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 
 	shadowtls "github.com/metacubex/sing-shadowtls"
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
+	"github.com/sirupsen/logrus"
 
+	relaypkg "github.com/iprw/shadowtun/pkg/relay"
 	stls "github.com/iprw/shadowtun/pkg/shadowtls"
 	"github.com/iprw/shadowtun/pkg/socks5"
 )
 
-const (
-	serverIdleTimeout  = 5 * time.Minute
-	serverWriteTimeout = 30 * time.Second
-)
-
 type forwardHandler struct {
 	forward string
+	logger  *logrus.Logger
 }
 
 func (h *forwardHandler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	Log.Debugf("New authenticated connection from %s", conn.RemoteAddr())
+	h.logger.Debugf("New authenticated connection from %s", conn.RemoteAddr())
 
 	backend, err := net.Dial("tcp", h.forward)
 	if err != nil {
-		Log.Warnf("Failed to connect to backend %s: %v", h.forward, err)
+		h.logger.Warnf("Failed to connect to backend %s: %v", h.forward, err)
 		return err
 	}
 	defer backend.Close()
 
-	Log.Debugf("Connected to backend %s", h.forward)
+	h.logger.Debugf("Connected to backend %s", h.forward)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		serverCopy(backend, conn)
+		relaypkg.CopyConn(backend, conn, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout)
 		if tc, ok := backend.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -51,88 +49,107 @@ func (h *forwardHandler) NewConnection(ctx context.Context, conn net.Conn, metad
 
 	go func() {
 		defer wg.Done()
-		serverCopy(conn, backend)
+		relaypkg.CopyConn(conn, backend, relaypkg.DefaultIdleTimeout, relaypkg.DefaultWriteTimeout)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 	}()
 
 	wg.Wait()
-	Log.Debugf("Connection from %s closed", conn.RemoteAddr())
+	h.logger.Debugf("Connection from %s closed", conn.RemoteAddr())
 	return nil
 }
 
 func (h *forwardHandler) NewError(ctx context.Context, err error) {
-	Log.Warnf("Handler error: %v", err)
-}
-
-// serverCopy copies data with idle and write timeouts to prevent ghost connections.
-func serverCopy(dst, src net.Conn) {
-	buf := make([]byte, 32*1024)
-	for {
-		src.SetReadDeadline(time.Now().Add(serverIdleTimeout))
-		n, err := src.Read(buf)
-		if n > 0 {
-			dst.SetWriteDeadline(time.Now().Add(serverWriteTimeout))
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
+	h.logger.Warnf("Handler error: %v", err)
 }
 
 type socks5Handler struct {
 	handler *socks5.Handler
+	logger  *logrus.Logger
 }
 
 func (h *socks5Handler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	Log.Debugf("New SOCKS5 connection from %s", conn.RemoteAddr())
+	h.logger.Debugf("New SOCKS5 connection from %s", conn.RemoteAddr())
 	err := h.handler.Handle(ctx, conn)
 	if err != nil {
-		Log.Warnf("SOCKS5 error from %s: %v", conn.RemoteAddr(), err)
+		h.logger.Warnf("SOCKS5 error from %s: %v", conn.RemoteAddr(), err)
 	}
 	return err
 }
 
 func (h *socks5Handler) NewError(ctx context.Context, err error) {
-	Log.Warnf("SOCKS5 handler error: %v", err)
+	h.logger.Warnf("SOCKS5 handler error: %v", err)
 }
 
-func runServer(listen, forward, handshake, password string, wildcardSNI, socks5Mode bool) {
-	Log.Infof("Starting ShadowTLS v3 server on %s", listen)
-	if socks5Mode {
-		Log.Infof("Mode: SOCKS5 proxy")
-	} else {
-		Log.Infof("Forwarding to: %s", forward)
+// ServerConfig holds configuration for the ShadowTLS server
+type ServerConfig struct {
+	ListenAddr  string
+	ForwardAddr string
+	Handshake   string
+	Password    string
+	WildcardSNI bool
+	Socks5Mode  bool
+	Logger      *logrus.Logger
+}
+
+// Server represents a ShadowTLS server instance
+type Server struct {
+	config *ServerConfig
+	log    *logrus.Logger
+}
+
+// NewServer creates a new server instance
+func NewServer(config *ServerConfig) *Server {
+	logger := config.Logger
+	if logger == nil {
+		logger = Log // Fallback to global logger
 	}
-	if wildcardSNI {
-		Log.Infof("Wildcard SNI enabled (handshake server determined by client SNI)")
-	} else if handshake != "" {
-		Log.Infof("Handshake server: %s", handshake)
+	return &Server{
+		config: config,
+		log:    logger,
+	}
+}
+
+// Run starts the server and blocks until shutdown
+func (s *Server) Run() error {
+	s.log.Infof("Starting ShadowTLS v3 server on %s", s.config.ListenAddr)
+	if s.config.Socks5Mode {
+		s.log.Infof("Mode: SOCKS5 proxy")
+	} else {
+		s.log.Infof("Forwarding to: %s", s.config.ForwardAddr)
+	}
+	if s.config.WildcardSNI {
+		s.log.Infof("Wildcard SNI enabled (handshake server determined by client SNI)")
+	} else if s.config.Handshake != "" {
+		s.log.Infof("Handshake server: %s", s.config.Handshake)
 	}
 
 	var handler shadowtls.Handler
-	if socks5Mode {
-		handler = &socks5Handler{handler: socks5.NewHandler("", "", Log)}
+	if s.config.Socks5Mode {
+		handler = &socks5Handler{
+			handler: socks5.NewHandler("", "", s.log),
+			logger:  s.log,
+		}
 	} else {
-		handler = &forwardHandler{forward: forward}
+		handler = &forwardHandler{
+			forward: s.config.ForwardAddr,
+			logger:  s.log,
+		}
 	}
 
 	config := shadowtls.ServiceConfig{
 		Version: 3,
 		Users: []shadowtls.User{
-			{Name: "default", Password: password},
+			{Name: "default", Password: s.config.Password},
 		},
 		StrictMode: false,
 		Handler:    handler,
-		Logger:     &stls.Logger{L: Log},
+		Logger:     &stls.Logger{L: s.log},
 	}
 
-	if handshake != "" {
-		handshakeHost, handshakePort := stls.ParseHostPort(handshake)
+	if s.config.Handshake != "" {
+		handshakeHost, handshakePort := stls.ParseHostPort(s.config.Handshake)
 		config.Handshake = shadowtls.HandshakeConfig{
 			Server: stls.MakeSocksaddr(handshakeHost, handshakePort),
 			Dialer: N.SystemDialer,
@@ -143,22 +160,22 @@ func runServer(listen, forward, handshake, password string, wildcardSNI, socks5M
 		}
 	}
 
-	if wildcardSNI {
+	if s.config.WildcardSNI {
 		config.WildcardSNI = shadowtls.WildcardSNIAuthed
 	}
 
 	service, err := shadowtls.NewService(config)
 	if err != nil {
-		Log.Fatalf("Failed to create ShadowTLS service: %v", err)
+		return fmt.Errorf("failed to create ShadowTLS service: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", listen)
+	listener, err := net.Listen("tcp", s.config.ListenAddr)
 	if err != nil {
-		Log.Fatalf("Failed to listen on %s: %v", listen, err)
+		return fmt.Errorf("failed to listen on %s: %v", s.config.ListenAddr, err)
 	}
 	defer listener.Close()
 
-	Log.Infof("Server listening on %s", listen)
+	s.log.Infof("Server listening on %s", s.config.ListenAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -167,7 +184,7 @@ func runServer(listen, forward, handshake, password string, wildcardSNI, socks5M
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		Log.Info("Shutting down...")
+		s.log.Info("Shutting down...")
 		cancel()
 		listener.Close()
 	}()
@@ -178,7 +195,7 @@ func runServer(listen, forward, handshake, password string, wildcardSNI, socks5M
 			select {
 			case <-ctx.Done():
 			default:
-				Log.Warnf("Accept error: %v", err)
+				s.log.Warnf("Accept error: %v", err)
 				continue
 			}
 			break
@@ -190,12 +207,13 @@ func runServer(listen, forward, handshake, password string, wildcardSNI, socks5M
 			defer c.Close()
 			err := service.NewConnection(ctx, c, M.Metadata{})
 			if err != nil {
-				Log.Warnf("Connection error from %s: %v", c.RemoteAddr(), err)
+				s.log.Warnf("Connection error from %s: %v", c.RemoteAddr(), err)
 			}
 		}(conn)
 	}
 
-	Log.Info("Waiting for connections to close...")
+	s.log.Info("Waiting for connections to close...")
 	wg.Wait()
-	Log.Info("Shutdown complete")
+	s.log.Info("Shutdown complete")
+	return nil
 }
