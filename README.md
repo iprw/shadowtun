@@ -1,5 +1,4 @@
 # ShadowTLS Tunnel
-
 A standalone [ShadowTLS](https://github.com/ihciah/shadow-tls) tunnel implementation in Go.
 
 This project provides a single-binary, config-free tunnel that leverages [sing-shadowtls](https://github.com/metacubex/sing-shadowtls) under the hood. It is intentionally decoupled from complex proxy platforms like sing-box, Xray, or Clash, offering a lightweight entry point to the "certificate stealing" technique without the overhead of a full anti-censorship stack.
@@ -125,3 +124,5 @@ We use [logrus](https://github.com/sirupsen/logrus) for structured, level-based 
 - **[utls](https://github.com/refraction-networking/utls)**: Essential for mimicking popular browser fingerprints.
 - **[sing](https://github.com/metacubex/sing)**: Common networking primitives.
 - **[logrus](https://github.com/sirupsen/logrus)**: Logging infrastructure.
+
+NB. This doesn't handle DNS... in my case my router/gateway still works as a resolver so didn't need to include any DNS handling.
