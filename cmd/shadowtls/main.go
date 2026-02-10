@@ -3,56 +3,93 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
+	"time"
 )
 
 func main() {
+	// Parse verbosity first (before flag.Parse to count -v flags)
+	// This removes -v, -vv, -vvv from args so flag.Parse doesn't complain
+	verbosity, filteredArgs := ParseVerbosity(os.Args[1:])
+	os.Args = append([]string{os.Args[0]}, filteredArgs...)
+
+	// Mode selection
 	mode := flag.String("mode", "", "Operation mode: server or client")
-	listen := flag.String("listen", "", "Listen address (e.g., 0.0.0.0:8443 for server, 127.0.0.1:2222 for client)")
-	server := flag.String("server", "", "ShadowTLS server address (client mode only)")
-	forward := flag.String("forward", "", "Backend address to forward to (server mode only, e.g., localhost:22)")
-	socks5Mode := flag.Bool("socks5", false, "Run SOCKS5 proxy server instead of port forward (server mode)")
-	handshake := flag.String("handshake", "", "TLS handshake server for camouflage (server mode, e.g., www.google.com:443)")
-	wildcardSNI := flag.Bool("wildcard-sni", false, "Use client's SNI as handshake server (server mode, makes --handshake optional)")
+
+	// Common flags
+	listen := flag.String("listen", "", "Listen address")
 	password := flag.String("password", "", "Shared password for authentication")
+
+	// Server flags
+	forward := flag.String("forward", "", "Backend address to forward to (server mode)")
+	socks5Mode := flag.Bool("socks5", false, "Run SOCKS5 proxy instead of port forward (server mode)")
+	handshake := flag.String("handshake", "", "TLS handshake server (server mode)")
+	wildcardSNI := flag.Bool("wildcard-sni", false, "Use client's SNI as handshake server (server mode)")
+
+	// Client flags
+	server := flag.String("server", "", "ShadowTLS server address (client mode)")
 	sni := flag.String("sni", "", "SNI for TLS handshake (client mode)")
+	poolSize := flag.Int("pool-size", 10, "Connection pool size (client mode)")
+	ttl := flag.Duration("ttl", 10*time.Second, "Connection TTL (client mode)")
+	backoff := flag.Duration("backoff", 5*time.Second, "Backoff on failure (client mode)")
+	timeout := flag.Duration("timeout", 10*time.Second, "Connection timeout (client mode)")
+	statsInterval := flag.Duration("stats-interval", 10*time.Second, "Stats interval, 0 to disable (client mode)")
 
 	flag.Parse()
 
-	if *mode == "" || *listen == "" || *password == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s --mode <server|client> --listen <addr:port> --password <secret> [options]\n\n", os.Args[0])
+	// Initialize logging with parsed verbosity
+	InitLogging(verbosity)
+
+	if *mode == "" || *password == "" {
+		fmt.Fprintf(os.Stderr, "Usage: %s --mode <server|client> --password <secret> [options]\n\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "Server mode options:")
-		fmt.Fprintln(os.Stderr, "  --forward <addr:port>    Backend to forward traffic to (e.g., localhost:22)")
+		fmt.Fprintln(os.Stderr, "  --listen <addr:port>     Listen address (e.g., 0.0.0.0:8443)")
+		fmt.Fprintln(os.Stderr, "  --forward <addr:port>    Backend to forward traffic to")
 		fmt.Fprintln(os.Stderr, "  --socks5                 Run SOCKS5 proxy instead of port forward")
-		fmt.Fprintln(os.Stderr, "  --handshake <host:port>  TLS server for handshake camouflage (e.g., www.google.com:443)")
-		fmt.Fprintln(os.Stderr, "  --wildcard-sni           Use client's SNI as handshake server (makes --handshake optional)")
+		fmt.Fprintln(os.Stderr, "  --handshake <host:port>  TLS server for handshake camouflage")
+		fmt.Fprintln(os.Stderr, "  --wildcard-sni           Use client's SNI as handshake server")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Client mode options:")
+		fmt.Fprintln(os.Stderr, "  --listen <addr:port>     Listen address (default: 127.0.0.1:1080)")
 		fmt.Fprintln(os.Stderr, "  --server <addr:port>     ShadowTLS server address")
 		fmt.Fprintln(os.Stderr, "  --sni <hostname>         SNI for TLS handshake")
+		fmt.Fprintln(os.Stderr, "  --pool-size <n>          Connection pool size (default: 10)")
+		fmt.Fprintln(os.Stderr, "  --ttl <duration>         Connection TTL (default: 10s)")
+		fmt.Fprintln(os.Stderr, "  --backoff <duration>     Retry backoff (default: 5s)")
+		fmt.Fprintln(os.Stderr, "  --timeout <duration>     Connection timeout (default: 10s)")
+		fmt.Fprintln(os.Stderr, "  --stats-interval <dur>   Stats logging interval (default: 10s, 0=disable)")
+		fmt.Fprintln(os.Stderr, "  -v, -vv, -vvv            Log verbosity (info/debug/trace)")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Examples:")
-		fmt.Fprintln(os.Stderr, "  Server: shadowtls --mode server --listen 0.0.0.0:8443 --forward localhost:22 --handshake www.google.com:443 --password secret")
-		fmt.Fprintln(os.Stderr, "  Client: shadowtls --mode client --listen 127.0.0.1:2222 --server example.com:8443 --sni www.google.com --password secret")
+		fmt.Fprintln(os.Stderr, "  Server: shadowtls --mode server --listen 0.0.0.0:8443 --socks5 --handshake www.google.com:443 --password secret")
+		fmt.Fprintln(os.Stderr, "  Client: shadowtls --mode client --server example.com:8443 --sni www.google.com --password secret -vvv")
 		os.Exit(1)
 	}
 
 	switch *mode {
 	case "server":
+		if *listen == "" {
+			Log.Fatal("Server mode requires --listen")
+		}
 		if *forward == "" && !*socks5Mode {
-			log.Fatal("Server mode requires --forward or --socks5 option")
+			Log.Fatal("Server mode requires --forward or --socks5")
+		}
+		if *forward != "" && *socks5Mode {
+			Log.Warn("Both --forward and --socks5 set; --socks5 takes precedence")
 		}
 		if *handshake == "" && !*wildcardSNI {
-			log.Fatal("Server mode requires --handshake or --wildcard-sni option")
+			Log.Fatal("Server mode requires --handshake or --wildcard-sni")
 		}
 		runServer(*listen, *forward, *handshake, *password, *wildcardSNI, *socks5Mode)
 	case "client":
 		if *server == "" || *sni == "" {
-			log.Fatal("Client mode requires --server and --sni options")
+			Log.Fatal("Client mode requires --server and --sni")
 		}
-		runClient(*listen, *server, *sni, *password)
+		if *listen == "" {
+			*listen = "127.0.0.1:1080"
+		}
+		runClient(*listen, *server, *sni, *password, *poolSize, *ttl, *backoff, *timeout, *statsInterval)
 	default:
-		log.Fatalf("Unknown mode: %s (use 'server' or 'client')", *mode)
+		Log.Fatalf("Unknown mode: %s (use 'server' or 'client')", *mode)
 	}
 }

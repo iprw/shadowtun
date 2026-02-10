@@ -6,6 +6,7 @@ require (
 	github.com/metacubex/sing v0.5.2
 	github.com/metacubex/sing-shadowtls v0.0.0-20250503063515-5d9f966d17a2
 	github.com/refraction-networking/utls v1.6.7
+	github.com/sirupsen/logrus v1.9.4
 )
 
 require (

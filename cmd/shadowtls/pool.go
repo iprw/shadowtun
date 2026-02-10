@@ -171,8 +171,7 @@ func (p *ConnPool) Get(ctx context.Context) (*PooledConn, error) {
 		case pc := <-p.connections:
 			poolAge := time.Since(pc.createdAt)
 
-			if poolAge < p.ttl {
-				p.stats.PoolReused.Add(1)
+			if poolAge <= p.ttl {
 				p.stats.PoolHits.Add(1)
 				p.stats.RecordPoolAge(poolAge)
 				p.stats.RecordPoolWait(time.Since(waitStart))
@@ -184,7 +183,7 @@ func (p *ConnPool) Get(ctx context.Context) (*PooledConn, error) {
 				}, nil
 			}
 			// Connection expired, close and try next
-			p.stats.PoolDiscarded.Add(1)
+			p.stats.PoolExpired.Add(1)
 			pc.Conn.Close()
 			continue
 

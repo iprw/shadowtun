@@ -2,30 +2,49 @@ package main
 
 import (
 	"fmt"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
+// atomicMin updates a to min(a, v) atomically.
+func atomicMin(a *atomic.Int64, v int64) {
+	for {
+		old := a.Load()
+		if v >= old || a.CompareAndSwap(old, v) {
+			return
+		}
+	}
+}
+
+// atomicMax updates a to max(a, v) atomically.
+func atomicMax(a *atomic.Int64, v int64) {
+	for {
+		old := a.Load()
+		if v <= old || a.CompareAndSwap(old, v) {
+			return
+		}
+	}
+}
+
 // Stats tracks performance metrics for the tunnel
 type Stats struct {
 	// Pool stats
-	PoolCreated      atomic.Uint64 // Connections created by pool
-	PoolReused       atomic.Uint64 // Connections reused from pool
-	PoolExpired      atomic.Uint64 // Connections that expired in pool
-	PoolFailed       atomic.Uint64 // Connection creation failures
-	PoolDiscarded    atomic.Uint64 // Connections discarded (dead/expired on get)
-	PoolStale        atomic.Uint64 // Connections that failed on first write (stale)
-	PoolWaitTime     atomic.Int64  // Total time spent waiting for pool (nanoseconds)
-	PoolWaitCount    atomic.Uint64 // Number of pool waits
-	PoolHits         atomic.Uint64 // Got connection from pool immediately
-	PoolMisses       atomic.Uint64 // Had to create new connection (pool empty)
+	PoolCreated   atomic.Uint64 // Connections created by pool workers
+	PoolExpired   atomic.Uint64 // Connections expired (TTL) when retrieved from pool
+	PoolFailed    atomic.Uint64 // Connection creation failures
+	PoolDiscarded atomic.Uint64 // Connections discarded by workers (pool full for TTL duration)
+	PoolStale     atomic.Uint64 // Connections that failed write/read verification
+	PoolWaitTime  atomic.Int64  // Total time spent waiting for pool (nanoseconds)
+	PoolWaitCount atomic.Uint64 // Number of pool waits
+	PoolHits      atomic.Uint64 // Got connection from pool
+	PoolMisses    atomic.Uint64 // Had to create new connection (pool empty)
 
 	// Connection stats
-	ActiveConns      atomic.Int64  // Currently active connections
-	TotalConns       atomic.Uint64 // Total connections handled
-	TotalBytes       atomic.Uint64 // Total bytes transferred
-	ConnErrors       atomic.Uint64 // Connection errors during relay
+	ActiveConns atomic.Int64  // Currently active connections
+	TotalConns  atomic.Uint64 // Total connections handled
+	TotalBytes  atomic.Uint64 // Total bytes transferred
+	ConnErrors  atomic.Uint64 // Connection errors during relay
 
 	// Timing stats (stored as nanoseconds)
 	ConnectTimeTotal atomic.Int64  // Total connection establishment time
@@ -50,8 +69,6 @@ type Stats struct {
 
 	// For peak tracking
 	peakActiveConns atomic.Int64
-
-	mu sync.Mutex
 }
 
 // NewStats creates a new stats tracker
@@ -71,22 +88,8 @@ func (s *Stats) RecordConnectTime(d time.Duration) {
 	ns := d.Nanoseconds()
 	s.ConnectTimeTotal.Add(ns)
 	s.ConnectTimeCount.Add(1)
-
-	// Update min
-	for {
-		old := s.ConnectTimeMin.Load()
-		if ns >= old || s.ConnectTimeMin.CompareAndSwap(old, ns) {
-			break
-		}
-	}
-
-	// Update max
-	for {
-		old := s.ConnectTimeMax.Load()
-		if ns <= old || s.ConnectTimeMax.CompareAndSwap(old, ns) {
-			break
-		}
-	}
+	atomicMin(&s.ConnectTimeMin, ns)
+	atomicMax(&s.ConnectTimeMax, ns)
 }
 
 // RecordConnLifetime records how long a connection was used
@@ -94,20 +97,8 @@ func (s *Stats) RecordConnLifetime(d time.Duration) {
 	ns := d.Nanoseconds()
 	s.ConnLifetimeTotal.Add(ns)
 	s.ConnLifetimeCount.Add(1)
-
-	for {
-		old := s.ConnLifetimeMin.Load()
-		if ns >= old || s.ConnLifetimeMin.CompareAndSwap(old, ns) {
-			break
-		}
-	}
-
-	for {
-		old := s.ConnLifetimeMax.Load()
-		if ns <= old || s.ConnLifetimeMax.CompareAndSwap(old, ns) {
-			break
-		}
-	}
+	atomicMin(&s.ConnLifetimeMin, ns)
+	atomicMax(&s.ConnLifetimeMax, ns)
 }
 
 // RecordPoolAge records how long a connection sat in the pool before use
@@ -115,20 +106,8 @@ func (s *Stats) RecordPoolAge(d time.Duration) {
 	ns := d.Nanoseconds()
 	s.PoolAgeTotal.Add(ns)
 	s.PoolAgeCount.Add(1)
-
-	for {
-		old := s.PoolAgeMin.Load()
-		if ns >= old || s.PoolAgeMin.CompareAndSwap(old, ns) {
-			break
-		}
-	}
-
-	for {
-		old := s.PoolAgeMax.Load()
-		if ns <= old || s.PoolAgeMax.CompareAndSwap(old, ns) {
-			break
-		}
-	}
+	atomicMin(&s.PoolAgeMin, ns)
+	atomicMax(&s.PoolAgeMax, ns)
 }
 
 // RecordPoolWait records time spent waiting for a connection from the pool
@@ -141,14 +120,7 @@ func (s *Stats) RecordPoolWait(d time.Duration) {
 func (s *Stats) ConnStart() {
 	s.TotalConns.Add(1)
 	active := s.ActiveConns.Add(1)
-
-	// Track peak
-	for {
-		peak := s.peakActiveConns.Load()
-		if active <= peak || s.peakActiveConns.CompareAndSwap(peak, active) {
-			break
-		}
-	}
+	atomicMax(&s.peakActiveConns, active)
 }
 
 // ConnEnd marks a connection as ended
@@ -161,35 +133,34 @@ func (s *Stats) AddBytes(n uint64) {
 	s.TotalBytes.Add(n)
 }
 
-// Snapshot returns a point-in-time snapshot of stats
+// StatsSnapshot is a point-in-time snapshot of stats
 type StatsSnapshot struct {
-	Uptime          time.Duration
+	Uptime time.Duration
 
 	// Pool
-	PoolSize        int
-	PoolAvailable   int
-	PoolCreated     uint64
-	PoolReused      uint64
-	PoolExpired     uint64
-	PoolFailed      uint64
-	PoolDiscarded   uint64
-	PoolStale       uint64
-	PoolHits        uint64
-	PoolMisses      uint64
-	PoolHitRate     float64
-	PoolAvgWait     time.Duration
+	PoolSize      int
+	PoolAvailable int
+	PoolCreated   uint64
+	PoolExpired   uint64
+	PoolFailed    uint64
+	PoolDiscarded uint64
+	PoolStale     uint64
+	PoolHits      uint64
+	PoolMisses    uint64
+	PoolHitRate   float64
+	PoolAvgWait   time.Duration
 
 	// Connections
-	ActiveConns     int64
-	PeakConns       int64
-	TotalConns      uint64
-	TotalBytes      uint64
-	ConnErrors      uint64
+	ActiveConns int64
+	PeakConns   int64
+	TotalConns  uint64
+	TotalBytes  uint64
+	ConnErrors  uint64
 
 	// Connection timing
-	AvgConnectTime  time.Duration
-	MinConnectTime  time.Duration
-	MaxConnectTime  time.Duration
+	AvgConnectTime time.Duration
+	MinConnectTime time.Duration
+	MaxConnectTime time.Duration
 
 	// Connection lifetime
 	AvgConnLifetime time.Duration
@@ -197,10 +168,9 @@ type StatsSnapshot struct {
 	MaxConnLifetime time.Duration
 
 	// Pool age (freshness)
-	AvgPoolAge      time.Duration
-	MinPoolAge      time.Duration
-	MaxPoolAge      time.Duration
-
+	AvgPoolAge time.Duration
+	MinPoolAge time.Duration
+	MaxPoolAge time.Duration
 }
 
 // Snapshot creates a stats snapshot
@@ -210,7 +180,6 @@ func (s *Stats) Snapshot(poolAvail, poolSize int) StatsSnapshot {
 		PoolSize:      poolSize,
 		PoolAvailable: poolAvail,
 		PoolCreated:   s.PoolCreated.Load(),
-		PoolReused:    s.PoolReused.Load(),
 		PoolExpired:   s.PoolExpired.Load(),
 		PoolFailed:    s.PoolFailed.Load(),
 		PoolDiscarded: s.PoolDiscarded.Load(),
@@ -304,7 +273,7 @@ Timing:
 `,
 		snap.Uptime.Round(time.Second),
 		snap.PoolSize, snap.PoolAvailable,
-		snap.PoolCreated, snap.PoolReused, snap.PoolHitRate,
+		snap.PoolCreated, snap.PoolHits, snap.PoolHitRate,
 		snap.PoolExpired, snap.PoolFailed, snap.PoolDiscarded, snap.PoolStale,
 		snap.PoolAvgWait.Round(time.Millisecond),
 		snap.ActiveConns, snap.PeakConns, snap.TotalConns,
@@ -342,7 +311,7 @@ func (snap StatsSnapshot) Log() {
 		parts = append(parts, fmt.Sprintf("fail=%d", snap.PoolFailed))
 	}
 	if len(parts) > 0 {
-		problems = " " + fmt.Sprintf("[%s]", joinStrings(parts, " "))
+		problems = " [" + strings.Join(parts, " ") + "]"
 	}
 
 	Log.Infof("[STATS] active=%d peak=%d total=%d pool=%d/%d hit=%.0f%% rtt=%v life=%v age=%v bytes=%s (%s)%s",
@@ -357,17 +326,6 @@ func (snap StatsSnapshot) Log() {
 	)
 }
 
-func joinStrings(parts []string, sep string) string {
-	result := ""
-	for i, p := range parts {
-		if i > 0 {
-			result += sep
-		}
-		result += p
-	}
-	return result
-}
-
 func formatBytes(b uint64) string {
 	const unit = 1024
 	if b < unit {
@@ -379,4 +337,17 @@ func formatBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func formatBytesShort(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(b)/float64(div), "KMGTPE"[exp])
 }

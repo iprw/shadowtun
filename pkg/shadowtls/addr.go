@@ -1,9 +1,9 @@
 package shadowtls
 
 import (
-	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 
 	M "github.com/metacubex/sing/common/metadata"
 )
@@ -15,8 +15,10 @@ func ParseHostPort(addr string) (string, uint16) {
 	if err != nil {
 		return addr, 443
 	}
-	var portNum int
-	fmt.Sscanf(port, "%d", &portNum)
+	portNum, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return host, 443
+	}
 	return host, uint16(portNum)
 }
 

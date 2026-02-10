@@ -13,7 +13,10 @@ import (
 func CreateHandshakeFunc(sni string) sing_shadowtls.TLSHandshakeFunc {
 	return func(ctx context.Context, conn net.Conn, sessionIDGenerator sing_shadowtls.TLSSessionIDGeneratorFunc) error {
 		tlsConfig := &utls.Config{
-			ServerName:         sni,
+			ServerName: sni,
+			// Certificate verification is intentionally skipped: ShadowTLS
+			// authenticates via HMAC in the TLS SessionID, not via the
+			// certificate chain. The TLS handshake is camouflage only.
 			InsecureSkipVerify: true,
 		}
 

@@ -2,16 +2,24 @@ package main
 
 import (
 	"context"
-	"io"
-	"log"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 
 	shadowtls "github.com/metacubex/sing-shadowtls"
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
 
-	shared "shadowtls-tunnel/pkg/shadowtls"
+	stls "shadowtls-tunnel/pkg/shadowtls"
+	"shadowtls-tunnel/pkg/socks5"
+)
+
+const (
+	serverIdleTimeout  = 5 * time.Minute
+	serverWriteTimeout = 30 * time.Second
 )
 
 type forwardHandler struct {
@@ -19,95 +27,96 @@ type forwardHandler struct {
 }
 
 func (h *forwardHandler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	log.Printf("New authenticated connection from %s", conn.RemoteAddr())
+	Log.Debugf("New authenticated connection from %s", conn.RemoteAddr())
 
 	backend, err := net.Dial("tcp", h.forward)
 	if err != nil {
-		log.Printf("Failed to connect to backend %s: %v", h.forward, err)
+		Log.Warnf("Failed to connect to backend %s: %v", h.forward, err)
 		return err
 	}
+	defer backend.Close()
 
-	log.Printf("Connected to backend %s", h.forward)
+	Log.Debugf("Connected to backend %s", h.forward)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		io.Copy(backend, conn)
-		backend.(*net.TCPConn).CloseWrite()
+		serverCopy(backend, conn)
+		if tc, ok := backend.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, backend)
+		serverCopy(conn, backend)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 	}()
 
 	wg.Wait()
-	backend.Close()
-	log.Printf("Connection from %s closed", conn.RemoteAddr())
+	Log.Debugf("Connection from %s closed", conn.RemoteAddr())
 	return nil
 }
 
 func (h *forwardHandler) NewError(ctx context.Context, err error) {
-	log.Printf("Handler error: %v", err)
+	Log.Warnf("Handler error: %v", err)
+}
+
+// serverCopy copies data with idle and write timeouts to prevent ghost connections.
+func serverCopy(dst, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		src.SetReadDeadline(time.Now().Add(serverIdleTimeout))
+		n, err := src.Read(buf)
+		if n > 0 {
+			dst.SetWriteDeadline(time.Now().Add(serverWriteTimeout))
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 type socks5Handler struct {
-	handler *SOCKS5Handler
+	handler *socks5.Handler
 }
 
 func (h *socks5Handler) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	log.Printf("New SOCKS5 connection from %s", conn.RemoteAddr())
+	Log.Debugf("New SOCKS5 connection from %s", conn.RemoteAddr())
 	err := h.handler.Handle(ctx, conn)
 	if err != nil {
-		log.Printf("SOCKS5 error from %s: %v", conn.RemoteAddr(), err)
+		Log.Warnf("SOCKS5 error from %s: %v", conn.RemoteAddr(), err)
 	}
 	return err
 }
 
 func (h *socks5Handler) NewError(ctx context.Context, err error) {
-	log.Printf("SOCKS5 handler error: %v", err)
+	Log.Warnf("SOCKS5 handler error: %v", err)
 }
 
-// stdLogger implements the sing-shadowtls ContextLogger interface
-// using the standard log package with level prefixes.
-type stdLogger struct{}
-
-func (l *stdLogger) Trace(args ...any)                             { log.Println(append([]any{"TRACE:"}, args...)...) }
-func (l *stdLogger) Debug(args ...any)                             { log.Println(append([]any{"DEBUG:"}, args...)...) }
-func (l *stdLogger) Info(args ...any)                              { log.Println(args...) }
-func (l *stdLogger) Warn(args ...any)                              { log.Println(append([]any{"WARN:"}, args...)...) }
-func (l *stdLogger) Error(args ...any)                             { log.Println(append([]any{"ERROR:"}, args...)...) }
-func (l *stdLogger) Fatal(args ...any)                             { log.Fatal(args...) }
-func (l *stdLogger) Panic(args ...any)                             { log.Panic(args...) }
-func (l *stdLogger) TraceContext(ctx context.Context, args ...any) { log.Println(append([]any{"TRACE:"}, args...)...) }
-func (l *stdLogger) DebugContext(ctx context.Context, args ...any) { log.Println(append([]any{"DEBUG:"}, args...)...) }
-func (l *stdLogger) InfoContext(ctx context.Context, args ...any)  { log.Println(args...) }
-func (l *stdLogger) WarnContext(ctx context.Context, args ...any)  { log.Println(append([]any{"WARN:"}, args...)...) }
-func (l *stdLogger) ErrorContext(ctx context.Context, args ...any) { log.Println(append([]any{"ERROR:"}, args...)...) }
-func (l *stdLogger) FatalContext(ctx context.Context, args ...any) { log.Fatal(args...) }
-func (l *stdLogger) PanicContext(ctx context.Context, args ...any) { log.Panic(args...) }
-
 func runServer(listen, forward, handshake, password string, wildcardSNI, socks5Mode bool) {
-	log.Printf("Starting ShadowTLS v3 server on %s", listen)
+	Log.Infof("Starting ShadowTLS v3 server on %s", listen)
 	if socks5Mode {
-		log.Printf("Mode: SOCKS5 proxy")
+		Log.Infof("Mode: SOCKS5 proxy")
 	} else {
-		log.Printf("Forwarding to: %s", forward)
+		Log.Infof("Forwarding to: %s", forward)
 	}
 	if wildcardSNI {
-		log.Printf("Wildcard SNI enabled (handshake server determined by client SNI)")
+		Log.Infof("Wildcard SNI enabled (handshake server determined by client SNI)")
 	} else if handshake != "" {
-		log.Printf("Handshake server: %s", handshake)
+		Log.Infof("Handshake server: %s", handshake)
 	}
 
 	var handler shadowtls.Handler
 	if socks5Mode {
-		handler = &socks5Handler{handler: NewSOCKS5Handler("", "")}
+		handler = &socks5Handler{handler: socks5.NewHandler("", "", Log)}
 	} else {
 		handler = &forwardHandler{forward: forward}
 	}
@@ -119,13 +128,13 @@ func runServer(listen, forward, handshake, password string, wildcardSNI, socks5M
 		},
 		StrictMode: false,
 		Handler:    handler,
-		Logger:     &stdLogger{},
+		Logger:     &stls.Logger{L: Log},
 	}
 
 	if handshake != "" {
-		handshakeHost, handshakePort := shared.ParseHostPort(handshake)
+		handshakeHost, handshakePort := stls.ParseHostPort(handshake)
 		config.Handshake = shadowtls.HandshakeConfig{
-			Server: shared.MakeSocksaddr(handshakeHost, handshakePort),
+			Server: stls.MakeSocksaddr(handshakeHost, handshakePort),
 			Dialer: N.SystemDialer,
 		}
 	} else {
@@ -140,31 +149,53 @@ func runServer(listen, forward, handshake, password string, wildcardSNI, socks5M
 
 	service, err := shadowtls.NewService(config)
 	if err != nil {
-		log.Fatalf("Failed to create ShadowTLS service: %v", err)
+		Log.Fatalf("Failed to create ShadowTLS service: %v", err)
 	}
 
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", listen, err)
+		Log.Fatalf("Failed to listen on %s: %v", listen, err)
 	}
 	defer listener.Close()
 
-	log.Printf("Server listening on %s", listen)
+	Log.Infof("Server listening on %s", listen)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		Log.Info("Shutting down...")
+		cancel()
+		listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
-			continue
+			select {
+			case <-ctx.Done():
+			default:
+				Log.Warnf("Accept error: %v", err)
+				continue
+			}
+			break
 		}
 
+		wg.Add(1)
 		go func(c net.Conn) {
+			defer wg.Done()
 			defer c.Close()
-			ctx := context.Background()
 			err := service.NewConnection(ctx, c, M.Metadata{})
 			if err != nil {
-				log.Printf("Connection error from %s: %v", c.RemoteAddr(), err)
+				Log.Warnf("Connection error from %s: %v", c.RemoteAddr(), err)
 			}
 		}(conn)
 	}
+
+	Log.Info("Waiting for connections to close...")
+	wg.Wait()
+	Log.Info("Shutdown complete")
 }

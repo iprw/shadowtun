@@ -1,17 +1,20 @@
-package main
+package socks5
 
 import (
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
+	"slices"
 	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const (
-	socks5Version = 0x05
+	Version = 0x05
 
 	// Auth methods
 	authNone     = 0x00
@@ -19,8 +22,7 @@ const (
 	authNoAccept = 0xFF
 
 	// Commands
-	cmdConnect      = 0x01
-	cmdUDPAssociate = 0x03
+	cmdConnect = 0x01
 
 	// Address types
 	atypIPv4   = 0x01
@@ -29,38 +31,36 @@ const (
 
 	// Reply codes
 	repSuccess          = 0x00
-	repGeneralFailure   = 0x01
-	repConnNotAllowed   = 0x02
-	repNetworkUnreach   = 0x03
 	repHostUnreach      = 0x04
-	repConnRefused      = 0x05
-	repTTLExpired       = 0x06
 	repCmdNotSupported  = 0x07
 	repAtypNotSupported = 0x08
+
+	idleTimeout  = 5 * time.Minute
+	writeTimeout = 30 * time.Second
 )
 
-// SOCKS5Handler handles SOCKS5 protocol on a connection
-type SOCKS5Handler struct {
+// Handler handles SOCKS5 protocol on a connection.
+type Handler struct {
 	username string
 	password string
+	logger   *logrus.Logger
 }
 
-// NewSOCKS5Handler creates a new SOCKS5 handler
-func NewSOCKS5Handler(username, password string) *SOCKS5Handler {
-	return &SOCKS5Handler{
+// NewHandler creates a new SOCKS5 handler.
+func NewHandler(username, password string, logger *logrus.Logger) *Handler {
+	return &Handler{
 		username: username,
 		password: password,
+		logger:   logger,
 	}
 }
 
-// Handle processes a SOCKS5 connection
-func (h *SOCKS5Handler) Handle(ctx context.Context, conn net.Conn) error {
-	// 1. Handshake - read auth methods
+// Handle processes a SOCKS5 connection.
+func (h *Handler) Handle(ctx context.Context, conn net.Conn) error {
 	if err := h.handshake(conn); err != nil {
 		return fmt.Errorf("handshake failed: %w", err)
 	}
 
-	// 2. Read request
 	cmd, target, err := h.readRequest(conn)
 	if err != nil {
 		return fmt.Errorf("read request failed: %w", err)
@@ -75,11 +75,9 @@ func (h *SOCKS5Handler) Handle(ctx context.Context, conn net.Conn) error {
 	}
 }
 
-// handleConnect handles TCP CONNECT requests
-func (h *SOCKS5Handler) handleConnect(conn net.Conn, target string) error {
-	log.Printf("SOCKS5 CONNECT to %s", target)
+func (h *Handler) handleConnect(conn net.Conn, target string) error {
+	h.logger.Infof("SOCKS5 CONNECT to %s", target)
 
-	// Connect to target
 	targetConn, err := net.Dial("tcp", target)
 	if err != nil {
 		h.sendReply(conn, repHostUnreach, nil)
@@ -87,25 +85,23 @@ func (h *SOCKS5Handler) handleConnect(conn net.Conn, target string) error {
 	}
 	defer targetConn.Close()
 
-	// Send success reply
 	localAddr := targetConn.LocalAddr().(*net.TCPAddr)
 	if err := h.sendReply(conn, repSuccess, localAddr); err != nil {
 		return fmt.Errorf("send reply failed: %w", err)
 	}
 
-	// Relay data
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, conn)
+		copyConn(targetConn, conn)
 		targetConn.(*net.TCPConn).CloseWrite()
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, targetConn)
+		copyConn(conn, targetConn)
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -115,68 +111,68 @@ func (h *SOCKS5Handler) handleConnect(conn net.Conn, target string) error {
 	return nil
 }
 
-func (h *SOCKS5Handler) handshake(conn net.Conn) error {
-	// Read version and number of methods
+// copyConn copies data with idle and write timeouts to prevent ghost connections.
+func copyConn(dst, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		src.SetReadDeadline(time.Now().Add(idleTimeout))
+		n, err := src.Read(buf)
+		if n > 0 {
+			dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (h *Handler) handshake(conn net.Conn) error {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return err
 	}
 
-	if header[0] != socks5Version {
+	if header[0] != Version {
 		return fmt.Errorf("unsupported SOCKS version: %d", header[0])
 	}
 
-	// Read methods
 	methods := make([]byte, header[1])
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return err
 	}
 
-	// Check if we need auth
 	needAuth := h.username != "" && h.password != ""
 
 	if needAuth {
-		// Look for username/password auth
-		hasAuth := false
-		for _, m := range methods {
-			if m == authPassword {
-				hasAuth = true
-				break
-			}
-		}
-		if !hasAuth {
-			conn.Write([]byte{socks5Version, authNoAccept})
+		if !slices.Contains(methods, authPassword) {
+			conn.Write([]byte{Version, authNoAccept})
 			return fmt.Errorf("client doesn't support password auth")
 		}
 
-		// Request password auth
-		conn.Write([]byte{socks5Version, authPassword})
+		if _, err := conn.Write([]byte{Version, authPassword}); err != nil {
+			return fmt.Errorf("write auth method: %w", err)
+		}
 
-		// Read auth request
 		if err := h.readAuth(conn); err != nil {
 			return err
 		}
 	} else {
-		// No auth required
-		hasNoAuth := false
-		for _, m := range methods {
-			if m == authNone {
-				hasNoAuth = true
-				break
-			}
-		}
-		if !hasNoAuth {
-			conn.Write([]byte{socks5Version, authNoAccept})
+		if !slices.Contains(methods, authNone) {
+			conn.Write([]byte{Version, authNoAccept})
 			return fmt.Errorf("client doesn't support no-auth")
 		}
-		conn.Write([]byte{socks5Version, authNone})
+		if _, err := conn.Write([]byte{Version, authNone}); err != nil {
+			return fmt.Errorf("write auth method: %w", err)
+		}
 	}
 
 	return nil
 }
 
-func (h *SOCKS5Handler) readAuth(conn net.Conn) error {
-	// Auth version
+func (h *Handler) readAuth(conn net.Conn) error {
 	version := make([]byte, 1)
 	if _, err := io.ReadFull(conn, version); err != nil {
 		return err
@@ -185,7 +181,6 @@ func (h *SOCKS5Handler) readAuth(conn net.Conn) error {
 		return fmt.Errorf("unsupported auth version: %d", version[0])
 	}
 
-	// Username
 	ulen := make([]byte, 1)
 	if _, err := io.ReadFull(conn, ulen); err != nil {
 		return err
@@ -195,7 +190,6 @@ func (h *SOCKS5Handler) readAuth(conn net.Conn) error {
 		return err
 	}
 
-	// Password
 	plen := make([]byte, 1)
 	if _, err := io.ReadFull(conn, plen); err != nil {
 		return err
@@ -205,30 +199,29 @@ func (h *SOCKS5Handler) readAuth(conn net.Conn) error {
 		return err
 	}
 
-	// Verify
 	if string(username) != h.username || string(password) != h.password {
-		conn.Write([]byte{0x01, 0x01}) // Auth failed
+		conn.Write([]byte{0x01, 0x01})
 		return fmt.Errorf("auth failed")
 	}
 
-	conn.Write([]byte{0x01, 0x00}) // Auth success
+	if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
+		return fmt.Errorf("write auth success: %w", err)
+	}
 	return nil
 }
 
-func (h *SOCKS5Handler) readRequest(conn net.Conn) (cmd byte, addr string, err error) {
-	// Read header: VER CMD RSV ATYP
+func (h *Handler) readRequest(conn net.Conn) (cmd byte, addr string, err error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return 0, "", err
 	}
 
-	if header[0] != socks5Version {
+	if header[0] != Version {
 		return 0, "", fmt.Errorf("unsupported version: %d", header[0])
 	}
 
 	cmd = header[1]
 
-	// Read address
 	var host string
 	switch header[3] {
 	case atypIPv4:
@@ -261,7 +254,6 @@ func (h *SOCKS5Handler) readRequest(conn net.Conn) (cmd byte, addr string, err e
 		return 0, "", fmt.Errorf("unsupported address type: %d", header[3])
 	}
 
-	// Read port
 	portBytes := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBytes); err != nil {
 		return 0, "", err
@@ -271,8 +263,8 @@ func (h *SOCKS5Handler) readRequest(conn net.Conn) (cmd byte, addr string, err e
 	return cmd, fmt.Sprintf("%s:%d", host, port), nil
 }
 
-func (h *SOCKS5Handler) sendReply(conn net.Conn, rep byte, addr *net.TCPAddr) error {
-	reply := []byte{socks5Version, rep, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
+func (h *Handler) sendReply(conn net.Conn, rep byte, addr *net.TCPAddr) error {
+	reply := []byte{Version, rep, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
 
 	if addr != nil {
 		ip := addr.IP.To4()

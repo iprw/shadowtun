@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# tunnel.sh - Set up a full system tunnel using tun2socks + steady-shadowtls
+# tunnel.sh - Set up a full system tunnel using tun2socks + shadowtls
 #
 # This script:
-# 1. Starts steady-shadowtls SOCKS5 client
+# 1. Starts shadowtls SOCKS5 client
 # 2. Creates a TUN interface
 # 3. Routes traffic through tun2socks
 # 4. Excludes the server IP to prevent routing loops
@@ -83,12 +83,12 @@ fi
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SHADOWTLS_BIN="$SCRIPT_DIR/steady-shadowtls"
+SHADOWTLS_BIN="$SCRIPT_DIR/shadowtls"
 
 # Check for required binaries
 if [[ ! -x "$SHADOWTLS_BIN" ]]; then
-    echo "Error: steady-shadowtls not found at $SHADOWTLS_BIN"
-    echo "Run: cd $SCRIPT_DIR && go build -o steady-shadowtls ."
+    echo "Error: shadowtls not found at $SHADOWTLS_BIN"
+    echo "Run: cd $SCRIPT_DIR && go build -o shadowtls ./cmd/shadowtls/"
     exit 1
 fi
 
@@ -126,8 +126,11 @@ fi
 
 echo "Default gateway: $DEFAULT_GW via $DEFAULT_IF"
 
-# DNS server (local router - doesn't need bypass route)
-DNS_SERVER="${DNS_SERVER:-192.168.1.1}"
+# DNS server (auto-detect from current resolv.conf, fallback to gateway)
+if [[ -z "$DNS_SERVER" ]]; then
+    DNS_SERVER=$(grep -m1 '^nameserver' /etc/resolv.conf | awk '{print $2}')
+    DNS_SERVER="${DNS_SERVER:-$DEFAULT_GW}"
+fi
 
 # Store original DNS
 ORIG_RESOLV=$(cat /etc/resolv.conf)
@@ -185,14 +188,16 @@ ip route add "$SERVER_IP/32" via "$DEFAULT_GW" dev "$DEFAULT_IF" 2>/dev/null || 
     echo "      (route may already exist)"
 echo "      DNS: $DNS_SERVER (local, no bypass needed)"
 
-# Step 2: Start steady-shadowtls
-echo "[2/5] Starting steady-shadowtls..."
+# Step 2: Start shadowtls client
+echo "[2/5] Starting shadowtls client..."
 "$SHADOWTLS_BIN" \
-    -listen "127.0.0.1:$LISTEN_PORT" \
-    -server "$SERVER" \
-    -sni "$SNI" \
-    -password "$PASSWORD" \
-    -pool-size "$POOL_SIZE" \
+    --mode client \
+    --listen "127.0.0.1:$LISTEN_PORT" \
+    --server "$SERVER" \
+    --sni "$SNI" \
+    --ttl 10s \
+    --password "$PASSWORD" \
+    --pool-size "$POOL_SIZE" \
     -vvv &
 SHADOWTLS_PID=$!
 
@@ -201,7 +206,7 @@ sleep 2
 
 # Check if it's running
 if ! kill -0 $SHADOWTLS_PID 2>/dev/null; then
-    echo "Error: steady-shadowtls failed to start"
+    echo "Error: shadowtls failed to start"
     exit 1
 fi
 echo "      PID: $SHADOWTLS_PID"
@@ -217,21 +222,6 @@ echo "[4/5] Starting tun2socks..."
 # TCP-only: UDP is not tunneled (DNS uses local router, QUIC falls back to TCP)
 tun2socks -device "tun://$TUN_NAME" -proxy "socks5://127.0.0.1:$LISTEN_PORT" -loglevel debug &
 TUN2SOCKS_PID=$!
-
-#sleep 2
-
-#if ! kill -0 $TUN2SOCKS_PID 2>/dev/null; then
-#    echo "Error: tun2socks failed to start"
-#    echo "Trying alternative syntax..."
-    # Try without tun:// prefix (older versions)
-#    tun2socks -device "$TUN_NAME" -proxy "socks5://127.0.0.1:$LISTEN_PORT" -loglevel debug &
-#    TUN2SOCKS_PID=$!
-#    sleep 2
-#    if ! kill -0 $TUN2SOCKS_PID 2>/dev/null; then
-#        echo "Error: tun2socks failed to start"
-#        exit 1
-#    fi
-#fi
 echo "      PID: $TUN2SOCKS_PID"
 
 # Step 5: Set up routing
